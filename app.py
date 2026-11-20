@@ -2,7 +2,11 @@ import streamlit as st
 import io
 import os
 from PIL import Image, ImageDraw
-from core.bg_remover import remove_background
+from core.bg_remover import (
+    remove_background,
+    draw_region_preview,
+    normalize_region
+)
 from core.enhancer import enhance_raster_image, AVAILABLE_ENGINES, is_model_downloaded
 from core.vectorizer import vectorize_image
 from core.exporter import export_print_package
@@ -50,22 +54,60 @@ st.markdown("""
         font-weight: 600;
         margin-bottom: 6px;
     }
+    .highlight-card {
+        background-color: #F0FDF4;
+        border: 1px solid #BBF7D0;
+        border-radius: 8px;
+        padding: 0.75rem;
+        margin-top: 0.5rem;
+        margin-bottom: 0.5rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">👕 T-Shirt Design Maker & Vectorizer</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Convert low-res client PNG & JPG files into crisp, scalable vector graphics (SVG, PDF, 300 DPI PNG) with local AI super-resolution for direct garment printing.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Convert low-res client PNG & JPG files into crisp, scalable vector graphics (SVG, PDF, 300 DPI PNG) with local AI super-resolution and quote/text preservation for direct garment printing.</div>', unsafe_allow_html=True)
+
+# Initialize session state for multi-region preservation
+if "preserved_regions" not in st.session_state:
+    st.session_state.preserved_regions = []
 
 # ----------------- SIDEBAR CONTROLS -----------------
 with st.sidebar:
     st.header("⚙️ Print & Vector Settings")
     
-    st.subheader("1. Background Isolation")
-    remove_bg = st.checkbox("Remove Background", value=True, help="Automatically cuts out white or noisy backgrounds using AI segmentation.")
+    st.subheader("1. Background Isolation & Quote Preservation")
+    remove_bg = st.checkbox(
+        "Remove Background",
+        value=True,
+        help="Automatically cuts out white or noisy backgrounds using AI segmentation."
+    )
     alpha_threshold = 25
+    preserve_quote_mode = False
+    clean_text_bg = True
+    text_threshold = 25
+
     if remove_bg:
-        alpha_threshold = st.slider("Alpha Edge Cutoff", 5, 80, 25, 
-                                    help="Eliminates faint semi-transparent edge halos to prevent DTF white ink bleeding.")
+        alpha_threshold = st.slider(
+            "Alpha Edge Cutoff", 5, 80, 25, 
+            help="Eliminates faint semi-transparent edge halos to prevent DTF white ink bleeding."
+        )
+        preserve_quote_mode = st.checkbox(
+            "Preserve Quotes & Text (Area Selector)",
+            value=True,
+            help="Enable interactive selection tool to specify quotes, typography, or slogans that AI background removers often erase."
+        )
+        if preserve_quote_mode:
+            clean_text_bg = st.checkbox(
+                "Auto-Clean Text Background",
+                value=True,
+                help="Automatically keys out the background behind letters inside the selected box so text is transparently integrated without a solid rectangular block."
+            )
+            text_threshold = st.slider(
+                "Text Stroke Sensitivity",
+                5, 80, 25,
+                help="Sensitivity for distinguishing letter strokes from the background inside the selected region."
+            )
     
     st.markdown("---")
     st.subheader("2. Local AI Super-Resolution")
@@ -144,57 +186,179 @@ with st.sidebar:
 
 # ----------------- MAIN AREA -----------------
 def generate_sample_badge():
-    """Create a sample low-resolution badge for immediate testing."""
-    img = Image.new("RGBA", (350, 350), (255, 255, 255, 255))
+    """Create a sample badge with both an emblem and a quote slogan to demonstrate text preservation."""
+    img = Image.new("RGBA", (400, 460), (255, 255, 255, 255))
     draw = ImageDraw.Draw(img)
-    # Circle badge
-    draw.ellipse([25, 25, 325, 325], fill="#1E3A8A", outline="#F59E0B", width=8)
-    draw.ellipse([50, 50, 300, 300], fill="#FFFFFF", outline="#1E3A8A", width=4)
-    # Shapes & Text
-    draw.rectangle([100, 140, 250, 210], fill="#EF4444")
-    draw.polygon([(175, 70), (210, 130), (140, 130)], fill="#F59E0B")
+    # Circle emblem
+    draw.ellipse([50, 30, 350, 330], fill="#1E3A8A", outline="#F59E0B", width=8)
+    draw.ellipse([80, 60, 320, 300], fill="#FFFFFF", outline="#1E3A8A", width=4)
+    # Shapes inside badge
+    draw.rectangle([130, 150, 270, 210], fill="#EF4444")
+    draw.polygon([(200, 85), (235, 140), (165, 140)], fill="#F59E0B")
+    
+    # Typography quote below badge
+    draw.text((105, 360), "VINTAGE MOTOR CLUB", fill="#1E3A8A")
+    draw.text((135, 395), "ESTABLISHED 1984", fill="#4B5563")
+    draw.text((120, 425), "• ORIGINAL HERITAGE •", fill="#F59E0B")
     return img
+
+if "use_sample" not in st.session_state:
+    st.session_state.use_sample = False
 
 uploaded_file = st.file_uploader("Upload client image (PNG, JPG, JPEG, WEBP)", type=["png", "jpg", "jpeg", "webp"])
 
 col_test1, col_test2 = st.columns([1, 4])
 with col_test1:
-    use_sample = st.button("🧪 Use Sample Low-Res Graphic", use_container_width=True)
+    if st.button("🧪 Use Sample Graphic with Quote", use_container_width=True):
+        st.session_state.use_sample = True
 
 input_image = None
+current_image_key = None
+
 if uploaded_file is not None:
+    st.session_state.use_sample = False
     input_image = Image.open(uploaded_file)
-elif use_sample:
+    current_image_key = f"upload_{uploaded_file.name}_{uploaded_file.size}"
+elif st.session_state.use_sample:
     input_image = generate_sample_badge()
+    current_image_key = "sample_badge"
+
+# Automatically reset preserved regions if image changes to prevent cross-image coordinate contamination
+if current_image_key:
+    if st.session_state.get("active_image_key") != current_image_key:
+        st.session_state.preserved_regions = []
+        st.session_state.active_image_key = current_image_key
 
 if input_image is not None:
     st.markdown("---")
     
+    # Active selection box state
+    active_selection_box = None
+    regions_to_use = []
+
+    # ----------------- INTERACTIVE QUOTE / TEXT SELECTION TOOL -----------------
+    if remove_bg and preserve_quote_mode:
+        st.subheader("✂️ Interactive Quote & Text Area Selector")
+        st.caption("AI background removal isolates the central illustration but frequently erases quotes and slogans. Indicate quote/text areas below to preserve both the artwork and the quote.")
+
+        cropper_col, preview_col = st.columns([1.2, 1])
+
+        with cropper_col:
+            st.markdown("**1. Move & Resize Selection Box Over the Quote / Text**")
+            
+            # Smart default coords: place initial box around the bottom 30% of the image
+            def_y1 = int(round(input_image.height * 0.72))
+            def_y2 = int(round(input_image.height * 0.96))
+            def_x1 = int(round(input_image.width * 0.10))
+            def_x2 = int(round(input_image.width * 0.90))
+            default_coords = (def_x1, def_x2, def_y1, def_y2)
+
+            from streamlit_cropper import st_cropper
+            cropped_img, active_selection_box = st_cropper(
+                input_image,
+                realtime_update=True,
+                box_color="#06B6D4",
+                aspect_ratio=None,
+                default_coords=default_coords,
+                return_type="both",
+                key=f"quote_cropper_{current_image_key}"
+            )
+
+        with preview_col:
+            st.markdown("**2. Selection Area & Preserved Regions**")
+            if cropped_img is not None:
+                st.image(cropped_img, caption=f"Active Selection Crop ({cropped_img.width} × {cropped_img.height} px)", use_container_width=True)
+
+            b_col1, b_col2 = st.columns(2)
+            with b_col1:
+                if st.button("➕ Add to Preserved List", use_container_width=True, help="Save this selection so you can select additional quotes or areas."):
+                    if active_selection_box:
+                        st.session_state.preserved_regions.append(dict(active_selection_box))
+                        st.rerun()
+            with b_col2:
+                if st.button("🗑️ Clear Preserved List", use_container_width=True):
+                    st.session_state.preserved_regions = []
+                    st.rerun()
+
+            # Check if active box is distinct from any saved region
+            active_coords = normalize_region(active_selection_box, input_image.width, input_image.height) if active_selection_box else None
+            is_active_distinct = False
+            regions_to_use = list(st.session_state.preserved_regions)
+
+            if active_coords:
+                is_duplicate = False
+                for r in st.session_state.preserved_regions:
+                    rc = normalize_region(r, input_image.width, input_image.height)
+                    if rc and abs(rc[0] - active_coords[0]) <= 5 and abs(rc[1] - active_coords[1]) <= 5 and abs(rc[2] - active_coords[2]) <= 5 and abs(rc[3] - active_coords[3]) <= 5:
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    is_active_distinct = True
+                    regions_to_use.append(dict(active_selection_box))
+
+            # Display saved regions list
+            if st.session_state.preserved_regions:
+                st.markdown(f"**📌 Preserved Regions ({len(st.session_state.preserved_regions)} Saved):**")
+                for i, r in enumerate(st.session_state.preserved_regions):
+                    r_c1, r_c2 = st.columns([3, 1])
+                    with r_c1:
+                        st.write(f"• **Region #{i+1}**: `X:{r.get('left',0)}, Y:{r.get('top',0)}, W:{r.get('width',0)}, H:{r.get('height',0)}`")
+                    with r_c2:
+                        if st.button("❌", key=f"del_region_{i}", help=f"Remove Region #{i+1}"):
+                            st.session_state.preserved_regions.pop(i)
+                            st.rerun()
+                if is_active_distinct:
+                    st.caption("💡 *Current active box (cyan) is also included automatically.*")
+            else:
+                st.info("💡 **Active box auto-preservation**: The active bounding box above will be preserved automatically when you generate the vector package.")
+
+        st.markdown("---")
+
+    # ----------------- PREVIEW & PRINT SPECS -----------------
     col_left, col_right = st.columns([1, 1])
     with col_left:
-        st.subheader("📷 Original Upload")
-        st.image(input_image, caption=f"Original Size: {input_image.width} × {input_image.height} px ({input_image.mode})", use_container_width=True)
+        st.subheader("📷 Design Overview & Selection Map")
+        # Show annotated preview if regions are selected
+        if preserve_quote_mode and remove_bg and (regions_to_use or active_selection_box):
+            preview_img = draw_region_preview(
+                input_image,
+                regions=st.session_state.preserved_regions,
+                active_box=active_selection_box if (is_active_distinct or not st.session_state.preserved_regions) else None
+            )
+            st.image(preview_img, caption=f"Highlighted Preserved Quote Regions ({input_image.width} × {input_image.height} px)", use_container_width=True)
+        else:
+            st.image(input_image, caption=f"Original Size: {input_image.width} × {input_image.height} px ({input_image.mode})", use_container_width=True)
     
     with col_right:
         st.subheader("🎯 Print Target Info")
         target_px_w = int(round(target_w * dpi))
         target_px_h = int(round(target_h * dpi))
         engine_label = engine_options.get(selected_engine_key, selected_engine_key)
+        
+        preservation_status = f"Active ({len(regions_to_use)} region(s) preserved)" if (preserve_quote_mode and remove_bg and regions_to_use) else "Disabled"
+        
         st.info(f"""
         - **Target Physical Size:** {target_w:.1f}" × {target_h:.1f}"
         - **Print Resolution:** {dpi} DPI ({target_px_w} × {target_px_h} px)
         - **AI Super-Resolution:** {engine_label} ({upscale_factor:.1f}x)
         - **Background Removal:** {'Active' if remove_bg else 'Disabled (Keep Original)'}
+        - **Quote / Text Preservation:** {preservation_status}
         - **Output Color Mode:** {'Full Color Stacked SVG' if colormode == 'color' else 'Monochrome Outlines'}
         """)
 
         process_button = st.button("🚀 Generate Print-Ready Vector Package", type="primary", use_container_width=True)
 
     if process_button:
-        with st.spinner("Processing image (Background removal ➔ AI De-pixelation ➔ Vector Tracing ➔ 300 DPI Export)..."):
-            # 1. Background removal
+        with st.spinner("Processing image (Background removal & quote preservation ➔ AI Enhancement ➔ Vector Tracing ➔ 300 DPI Export)..."):
+            # 1. Background removal with selective quote/text preservation
             if remove_bg:
-                processed_raster = remove_background(input_image, alpha_threshold=alpha_threshold)
+                processed_raster = remove_background(
+                    input_image,
+                    alpha_threshold=alpha_threshold,
+                    preserve_regions=regions_to_use if preserve_quote_mode else None,
+                    clean_text_background=clean_text_bg,
+                    text_threshold=text_threshold
+                )
             else:
                 processed_raster = input_image.copy()
 
@@ -227,17 +391,17 @@ if input_image is not None:
                 dpi=dpi
             )
 
-            st.success("🎉 Vectorization and print preparation completed successfully!")
+            st.success("🎉 Vectorization and print preparation completed successfully! Both illustration and quote typography preserved.")
 
             # Display Tabs
             tab_vector, tab_comparison, tab_download = st.tabs([
                 "✨ Vector Preview (SVG)",
-                "🔍 AI Enhanced Master vs Original",
+                "🔍 Preserved Master vs Original",
                 "📥 Download Print Package"
             ])
 
             with tab_vector:
-                st.subheader("Scalable Vector Output")
+                st.subheader("Scalable Vector Output (Artwork + Preserved Quote)")
                 st.components.v1.html(
                     f"""
                     <div style="display:flex; justify-content:center; align-items:center; background:#F9FAFB; padding:20px; border-radius:8px; border:1px solid #E5E7EB; min-height:400px;">
@@ -248,17 +412,17 @@ if input_image is not None:
                     """,
                     height=520
                 )
-                st.caption("Zoom in as much as you want — vector edges never pixelate or blur.")
+                st.caption("Zoom in as much as you want — both the graphic artwork and quote text are scalable vector curves.")
 
             with tab_comparison:
-                st.subheader("AI Super-Resolution Comparison")
+                st.subheader("Comparison: Original vs Cleaned Transparent Master")
                 c_orig, c_enh = st.columns(2)
                 with c_orig:
-                    st.markdown("**Original Upload (Low Resolution)**")
+                    st.markdown("**Original Upload (With Background)**")
                     st.image(input_image, caption=f"{input_image.width} × {input_image.height} px", use_container_width=True)
                 with c_enh:
-                    st.markdown(f"**AI Super-Resolved Master ({engine_meta.get('name', 'Enhanced')})**")
-                    st.image(enhanced_raster, caption=f"{enhanced_raster.width} × {enhanced_raster.height} px (Smooth Anti-Aliased Curves)", use_container_width=True)
+                    st.markdown(f"**Cleaned Master with Preserved Quote ({engine_meta.get('name', 'Enhanced')})**")
+                    st.image(enhanced_raster, caption=f"{enhanced_raster.width} × {enhanced_raster.height} px (Graphic + Quote Preserved on Transparent Canvas)", use_container_width=True)
 
             with tab_download:
                 st.subheader("📦 Download Files for Your Printer")
@@ -300,7 +464,7 @@ if input_image is not None:
                     )
 
 else:
-    st.info("👆 Upload an image or click **'🧪 Use Sample Low-Res Graphic'** above to get started.")
+    st.info("👆 Upload an image or click **'🧪 Use Sample Graphic with Quote'** above to get started.")
 
 st.markdown("---")
 st.markdown("<div style='text-align: center; color: #9CA3AF; font-size: 0.85rem;'>T-Shirt Design Maker • Powered by Real-ESRGAN AI, VTracer & Rembg</div>", unsafe_allow_html=True)

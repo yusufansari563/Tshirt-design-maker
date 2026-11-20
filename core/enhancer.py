@@ -123,6 +123,7 @@ def get_onnx_session(engine_key: str, models_dir: Optional[str] = None):
         
         # Configure session options for optimal execution
         sess_opts = ort.SessionOptions()
+        sess_opts.enable_cpu_mem_arena = False
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         
         available_providers = ort.get_available_providers()
@@ -162,7 +163,7 @@ def _prevent_alpha_bleed(bgr_image: np.ndarray, alpha_channel: np.ndarray) -> np
 def _run_tiled_inference(
     session,
     rgb_float: np.ndarray,
-    tile_size: int = 512,
+    tile_size: int = 192,
     tile_pad: int = 16,
     scale: int = 4
 ) -> np.ndarray:
@@ -221,7 +222,7 @@ def enhance_raster_image(
     denoise_strength: int = 0,
     sharpen_amount: float = 1.0,
     contrast_boost: float = 1.0,
-    tile_size: int = 512,
+    tile_size: int = 192,
     tile_pad: int = 16,
     models_dir: Optional[str] = None,
     **kwargs

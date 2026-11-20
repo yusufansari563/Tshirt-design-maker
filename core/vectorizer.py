@@ -7,7 +7,6 @@ import os
 import tempfile
 from typing import Optional
 from PIL import Image
-import vtracer
 
 def vectorize_image(
     image: Image.Image,
@@ -63,6 +62,8 @@ def vectorize_image(
             cleanup_output = False
         else:
             cleanup_output = False
+
+        import vtracer
 
         vtracer.convert_image_to_svg_py(
             temp_input_path,
