@@ -4,6 +4,8 @@ import os
 from PIL import Image, ImageDraw
 from core.bg_remover import (
     remove_background,
+    extract_garment_design,
+    calculate_regions_bbox,
     draw_region_preview,
     normalize_region
 )
@@ -76,38 +78,52 @@ if "preserved_regions" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Print & Vector Settings")
     
-    st.subheader("1. Background Isolation & Quote Preservation")
-    remove_bg = st.checkbox(
-        "Remove Background",
-        value=True,
-        help="Automatically cuts out white or noisy backgrounds using AI segmentation."
+    st.subheader("1. Background & Garment Isolation")
+    bg_mode = st.radio(
+        "Isolation Mode",
+        options=[
+            "Auto-Detect Garment Fabric (Best for T-Shirt Mockups & Photos)",
+            "AI Subject Segmentation (rembg)",
+            "Keep Background (No Removal)"
+        ],
+        index=0,
+        help="Use 'Auto-Detect Garment Fabric' when your image is a photo of a t-shirt or mockup—it keys out the garment cloth so quotes and graphics remain. Use 'AI Subject Segmentation' for standalone graphics."
     )
+    remove_bg = bg_mode != "Keep Background (No Removal)"
+    
     alpha_threshold = 25
-    preserve_quote_mode = False
-    clean_text_bg = True
-    text_threshold = 25
-
     if remove_bg:
         alpha_threshold = st.slider(
             "Alpha Edge Cutoff", 5, 80, 25, 
             help="Eliminates faint semi-transparent edge halos to prevent DTF white ink bleeding."
         )
-        preserve_quote_mode = st.checkbox(
-            "Preserve Quotes & Text (Area Selector)",
-            value=True,
-            help="Enable interactive selection tool to specify quotes, typography, or slogans that AI background removers often erase."
+
+    fabric_tolerance = 30
+    if "Garment Fabric" in bg_mode:
+        fabric_tolerance = st.slider(
+            "Fabric Color Tolerance", 10, 80, 30,
+            help="Threshold for identifying and removing the t-shirt cloth color behind the design."
         )
-        if preserve_quote_mode:
-            clean_text_bg = st.checkbox(
-                "Auto-Clean Text Background",
-                value=True,
-                help="Automatically keys out the background behind letters inside the selected box so text is transparently integrated without a solid rectangular block."
-            )
-            text_threshold = st.slider(
-                "Text Stroke Sensitivity",
-                5, 80, 25,
-                help="Sensitivity for distinguishing letter strokes from the background inside the selected region."
-            )
+
+    preserve_quote_mode = st.checkbox(
+        "Interactive Area Selection & Cropping Tool",
+        value=True,
+        help="Enable interactive selection box to crop directly to the design or quote area on the t-shirt."
+    )
+    
+    clean_text_bg = True
+    text_threshold = 25
+    if preserve_quote_mode and "rembg" in bg_mode:
+        clean_text_bg = st.checkbox(
+            "Auto-Clean Text Background",
+            value=True,
+            help="Automatically keys out the background behind letters inside the selected box so text is transparently integrated without a solid rectangular block."
+        )
+        text_threshold = st.slider(
+            "Text Stroke Sensitivity",
+            5, 80, 25,
+            help="Sensitivity for distinguishing letter strokes from the background inside the selected region."
+        )
     
     st.markdown("---")
     st.subheader("2. Local AI Super-Resolution")
@@ -235,22 +251,23 @@ if input_image is not None:
     # Active selection box state
     active_selection_box = None
     regions_to_use = []
+    crop_scope = "🖼️ Keep Full Image Canvas (Process Whole Image)"
 
     # ----------------- INTERACTIVE QUOTE / TEXT SELECTION TOOL -----------------
     if remove_bg and preserve_quote_mode:
-        st.subheader("✂️ Interactive Quote & Text Area Selector")
-        st.caption("AI background removal isolates the central illustration but frequently erases quotes and slogans. Indicate quote/text areas below to preserve both the artwork and the quote.")
+        st.subheader("✂️ Interactive Design & Text Area Selector")
+        st.caption("Select the print or quote area on the t-shirt to extract ONLY that design (discarding the t-shirt cloth, sleeves, and photo background).")
 
         cropper_col, preview_col = st.columns([1.2, 1])
 
         with cropper_col:
-            st.markdown("**1. Move & Resize Selection Box Over the Quote / Text**")
+            st.markdown("**1. Move & Resize Selection Box Over the Design / Quote**")
             
-            # Smart default coords: place initial box around the bottom 30% of the image
-            def_y1 = int(round(input_image.height * 0.72))
-            def_y2 = int(round(input_image.height * 0.96))
-            def_x1 = int(round(input_image.width * 0.10))
-            def_x2 = int(round(input_image.width * 0.90))
+            # Smart default coords: place initial box around the center 50% of the image
+            def_y1 = int(round(input_image.height * 0.25))
+            def_y2 = int(round(input_image.height * 0.75))
+            def_x1 = int(round(input_image.width * 0.20))
+            def_x2 = int(round(input_image.width * 0.80))
             default_coords = (def_x1, def_x2, def_y1, def_y2)
 
             from streamlit_cropper import st_cropper
@@ -265,9 +282,19 @@ if input_image is not None:
             )
 
         with preview_col:
-            st.markdown("**2. Selection Area & Preserved Regions**")
+            st.markdown("**2. Selection Area & Output Scope**")
             if cropped_img is not None:
-                st.image(cropped_img, caption=f"Active Selection Crop ({cropped_img.width} × {cropped_img.height} px)", use_container_width=True)
+                st.image(cropped_img, caption=f"Active Selection Area ({cropped_img.width} × {cropped_img.height} px)", use_container_width=True)
+
+            crop_scope = st.radio(
+                "🎯 Output Scope",
+                options=[
+                    "🎯 Crop to Selected Design Area (Extract Artwork Only)",
+                    "🖼️ Keep Full Image Canvas (Process Whole Image)"
+                ],
+                index=0,
+                help="When 'Crop to Selected Design Area' is chosen, the tool extracts ONLY the design inside your selection (discarding the t-shirt garment, sleeves, and photo background). This is ideal when working with photos of t-shirts!"
+            )
 
             b_col1, b_col2 = st.columns(2)
             with b_col1:
@@ -310,7 +337,7 @@ if input_image is not None:
                 if is_active_distinct:
                     st.caption("💡 *Current active box (cyan) is also included automatically.*")
             else:
-                st.info("💡 **Active box auto-preservation**: The active bounding box above will be preserved automatically when you generate the vector package.")
+                st.info("💡 **Auto-Extraction Active**: The active bounding box above will be extracted and vectorized when you generate the print package.")
 
         st.markdown("---")
 
@@ -325,7 +352,7 @@ if input_image is not None:
                 regions=st.session_state.preserved_regions,
                 active_box=active_selection_box if (is_active_distinct or not st.session_state.preserved_regions) else None
             )
-            st.image(preview_img, caption=f"Highlighted Preserved Quote Regions ({input_image.width} × {input_image.height} px)", use_container_width=True)
+            st.image(preview_img, caption=f"Highlighted Design Selection ({input_image.width} × {input_image.height} px)", use_container_width=True)
         else:
             st.image(input_image, caption=f"Original Size: {input_image.width} × {input_image.height} px ({input_image.mode})", use_container_width=True)
     
@@ -335,32 +362,73 @@ if input_image is not None:
         target_px_h = int(round(target_h * dpi))
         engine_label = engine_options.get(selected_engine_key, selected_engine_key)
         
-        preservation_status = f"Active ({len(regions_to_use)} region(s) preserved)" if (preserve_quote_mode and remove_bg and regions_to_use) else "Disabled"
+        preservation_status = f"Active ({len(regions_to_use)} region(s) selected)" if (preserve_quote_mode and remove_bg and regions_to_use) else "Disabled"
         
         st.info(f"""
         - **Target Physical Size:** {target_w:.1f}" × {target_h:.1f}"
         - **Print Resolution:** {dpi} DPI ({target_px_w} × {target_px_h} px)
+        - **Output Scope:** {crop_scope}
         - **AI Super-Resolution:** {engine_label} ({upscale_factor:.1f}x)
-        - **Background Removal:** {'Active' if remove_bg else 'Disabled (Keep Original)'}
-        - **Quote / Text Preservation:** {preservation_status}
+        - **Background Isolation:** {bg_mode}
+        - **Area Selector:** {preservation_status}
         - **Output Color Mode:** {'Full Color Stacked SVG' if colormode == 'color' else 'Monochrome Outlines'}
         """)
 
         process_button = st.button("🚀 Generate Print-Ready Vector Package", type="primary", use_container_width=True)
 
     if process_button:
-        with st.spinner("Processing image (Background removal & quote preservation ➔ AI Enhancement ➔ Vector Tracing ➔ 300 DPI Export)..."):
-            # 1. Background removal with selective quote/text preservation
-            if remove_bg:
-                processed_raster = remove_background(
-                    input_image,
-                    alpha_threshold=alpha_threshold,
-                    preserve_regions=regions_to_use if preserve_quote_mode else None,
-                    clean_text_background=clean_text_bg,
-                    text_threshold=text_threshold
-                )
+        with st.spinner("Processing image (Extracting design ➔ AI Super-Resolution ➔ Vector Tracing ➔ 300 DPI Export)..."):
+            # Determine unified bounding box if cropping to selected area
+            should_crop_to_selection = preserve_quote_mode and (crop_scope.startswith("🎯"))
+            selected_bbox = None
+            if should_crop_to_selection:
+                selected_bbox = calculate_regions_bbox(regions_to_use, input_image.width, input_image.height, padding=8)
+                if selected_bbox is None and active_selection_box:
+                    selected_bbox = normalize_region(active_selection_box, input_image.width, input_image.height)
+
+            if should_crop_to_selection and selected_bbox is not None:
+                # 1. Extract only the design from the garment mockup / crop area
+                if "Garment Fabric" in bg_mode:
+                    processed_raster = extract_garment_design(
+                        input_image,
+                        bbox=selected_bbox,
+                        method="fabric_key",
+                        tolerance=fabric_tolerance,
+                        alpha_threshold=alpha_threshold
+                    )
+                elif "rembg" in bg_mode:
+                    processed_raster = extract_garment_design(
+                        input_image,
+                        bbox=selected_bbox,
+                        method="rembg",
+                        alpha_threshold=alpha_threshold
+                    )
+                else:
+                    processed_raster = extract_garment_design(
+                        input_image,
+                        bbox=selected_bbox,
+                        method="none"
+                    )
             else:
-                processed_raster = input_image.copy()
+                # Process full image
+                if "Garment Fabric" in bg_mode:
+                    processed_raster = extract_garment_design(
+                        input_image,
+                        bbox=None,
+                        method="fabric_key",
+                        tolerance=fabric_tolerance,
+                        alpha_threshold=alpha_threshold
+                    )
+                elif "rembg" in bg_mode:
+                    processed_raster = remove_background(
+                        input_image,
+                        alpha_threshold=alpha_threshold,
+                        preserve_regions=regions_to_use if preserve_quote_mode else None,
+                        clean_text_background=clean_text_bg,
+                        text_threshold=text_threshold
+                    )
+                else:
+                    processed_raster = input_image.copy()
 
             # 2. Local AI Super-Resolution & Enhancement
             enhanced_raster = enhance_raster_image(

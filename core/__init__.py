@@ -8,6 +8,8 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 from .bg_remover import (
     remove_background,
+    extract_garment_design,
+    calculate_regions_bbox,
     normalize_region,
     extract_text_mask_from_region,
     apply_preserved_regions,
@@ -19,6 +21,8 @@ from .exporter import export_print_package
 
 __all__ = [
     "remove_background",
+    "extract_garment_design",
+    "calculate_regions_bbox",
     "normalize_region",
     "extract_text_mask_from_region",
     "apply_preserved_regions",

@@ -11,6 +11,8 @@ from PIL import Image, ImageDraw
 import numpy as np
 from core.bg_remover import (
     remove_background,
+    extract_garment_design,
+    calculate_regions_bbox,
     normalize_region,
     extract_text_mask_from_region,
     apply_preserved_regions,
@@ -294,9 +296,52 @@ def test_edge_cases():
     print("\n[SUCCESS] ALL EDGE CASES PASSED SUCCESSFULLY!")
 
 
+def test_garment_design_extraction():
+    print("\n--- Testing Garment Mockup Design Extraction & Cropping ---")
+    
+    # 1. Create synthetic t-shirt mockup (black shirt with white quote inside)
+    mockup = Image.new("RGB", (500, 600), (180, 180, 180)) # room background
+    draw = ImageDraw.Draw(mockup)
+    # Draw black t-shirt body
+    draw.polygon([(100, 120), (200, 60), (300, 60), (400, 120), (450, 220), (380, 260), (380, 580), (120, 580), (120, 260), (50, 220)], fill=(32, 33, 40))
+    # Draw white graphic on chest
+    draw.ellipse([200, 220, 300, 320], fill=(240, 240, 240))
+    draw.text((180, 340), "SOFTWARE DEVELOPER", fill=(255, 255, 255))
+    
+    # User selects the chest design area
+    chest_box = {"left": 160, "top": 200, "width": 180, "height": 170}
+    coords = normalize_region(chest_box, 500, 600)
+    assert coords == (160, 200, 340, 370)
+    
+    # Extract design (crop to box + remove black fabric)
+    extracted = extract_garment_design(mockup, bbox=coords, method="fabric_key", tolerance=30)
+    assert extracted.size == (180, 170)
+    assert extracted.mode == "RGBA"
+    
+    arr = np.array(extracted)
+    alpha = arr[:, :, 3]
+    # Fabric at corner (0, 0) of the crop should be transparent
+    assert alpha[0, 0] < 20, f"Expected transparent fabric, got {alpha[0, 0]}"
+    # Graphic at center of circle should be opaque
+    center_y = 270 - 200
+    center_x = 250 - 160
+    assert alpha[center_y, center_x] > 200, f"Expected opaque graphic, got {alpha[center_y, center_x]}"
+    print("  [OK] Design cropped and fabric keyed out cleanly to transparent.")
+    
+    # 2. calculate_regions_bbox
+    regions = [
+        {"left": 100, "top": 150, "width": 50, "height": 40},
+        {"left": 200, "top": 300, "width": 60, "height": 50}
+    ]
+    unified_bbox = calculate_regions_bbox(regions, 500, 600, padding=10)
+    assert unified_bbox == (90, 140, 270, 360), f"Expected (90, 140, 270, 360), got {unified_bbox}"
+    print("  [OK] calculate_regions_bbox unified multiple regions correctly.")
+
+
 if __name__ == "__main__":
     run_test()
     test_quote_text_preservation()
+    test_garment_design_extraction()
     test_region_utilities()
     test_ai_engines()
     test_edge_cases()

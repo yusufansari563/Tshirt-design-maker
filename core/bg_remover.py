@@ -243,6 +243,134 @@ def draw_region_preview(
     return overlay_img
 
 
+def calculate_regions_bbox(
+    regions: List[Any],
+    img_width: int,
+    img_height: int,
+    padding: int = 5
+) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Computes the unified bounding box (x1, y1, x2, y2) enclosing all provided regions,
+    with optional padding clamped to image bounds.
+    """
+    if not regions:
+        return None
+
+    min_x, min_y = img_width, img_height
+    max_x, max_y = 0, 0
+    valid_count = 0
+
+    for reg in regions:
+        coords = normalize_region(reg, img_width, img_height)
+        if coords is not None:
+            x1, y1, x2, y2 = coords
+            min_x = min(min_x, x1)
+            min_y = min(min_y, y1)
+            max_x = max(max_x, x2)
+            max_y = max(max_y, y2)
+            valid_count += 1
+
+    if valid_count == 0 or max_x <= min_x or max_y <= min_y:
+        return None
+
+    # Apply padding
+    x1 = max(0, min_x - padding)
+    y1 = max(0, min_y - padding)
+    x2 = min(img_width, max_x + padding)
+    y2 = min(img_height, max_y + padding)
+
+    return (x1, y1, x2, y2)
+
+
+def extract_garment_design(
+    image: Image.Image,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    method: str = "fabric_key",          # "fabric_key", "rembg", or "none"
+    tolerance: int = 30,
+    edge_feather: int = 8,
+    alpha_threshold: int = 25
+) -> Image.Image:
+    """
+    Extracts print design from a garment mockup or selected area.
+    Crops to the specified bounding box (or uses full image if bbox is None),
+    and removes the garment fabric background so only the printed artwork/text remains.
+    
+    Args:
+        image: Source PIL Image
+        bbox: Optional (x1, y1, x2, y2) crop coordinates
+        method: 'fabric_key' (smart color keying based on garment cloth),
+                'rembg' (AI neural segmentation on the crop),
+                or 'none' (just crop without removing background)
+        tolerance: Color distance threshold for fabric keying
+        edge_feather: Feathering softness for anti-aliasing edges
+        alpha_threshold: Cutoff for faint semi-transparent pixels
+        
+    Returns:
+        PIL Image in RGBA mode containing only the extracted design.
+    """
+    if bbox is not None:
+        W, H = image.size
+        coords = normalize_region(bbox, W, H)
+        if coords is not None:
+            x1, y1, x2, y2 = coords
+            crop = image.crop((x1, y1, x2, y2))
+        else:
+            crop = image.copy()
+    else:
+        crop = image.copy()
+
+    if method == "none":
+        return crop.convert("RGBA")
+
+    if method == "rembg":
+        from rembg import remove
+        session = get_rembg_session()
+        if session is not None:
+            res = remove(crop, session=session)
+        else:
+            res = remove(crop)
+        res_rgba = res.convert("RGBA")
+        if alpha_threshold > 0:
+            arr = np.array(res_rgba)
+            arr[arr[:, :, 3] < alpha_threshold, 3] = 0
+            res_rgba = Image.fromarray(arr, mode="RGBA")
+        return res_rgba
+
+    # Default: "fabric_key" (Smart Garment Fabric Keying)
+    crop_rgba = crop.convert("RGBA")
+    arr = np.array(crop_rgba)
+    h, w = arr.shape[:2]
+    if h < 4 or w < 4:
+        return crop_rgba
+
+    # Sample perimeter border pixels to identify the garment cloth color
+    b_w = max(2, min(8, min(h, w) // 15))
+    top_b = arr[:b_w, :, :3].reshape(-1, 3)
+    bot_b = arr[-b_w:, :, :3].reshape(-1, 3)
+    left_b = arr[:, :b_w, :3].reshape(-1, 3)
+    right_b = arr[:, -b_w:, :3].reshape(-1, 3)
+    border = np.concatenate([top_b, bot_b, left_b, right_b], axis=0)
+
+    # Use median to avoid outliers from graphic elements touching the boundary
+    fabric_color = np.median(border, axis=0)
+
+    # Compute Euclidean distance in RGB color space from the fabric color
+    diff = np.linalg.norm(arr[:, :, :3].astype(np.float32) - fabric_color.astype(np.float32), axis=-1)
+
+    low_cutoff = max(2.0, float(tolerance) - float(edge_feather))
+    high_cutoff = float(tolerance) + float(edge_feather)
+
+    # Anti-aliased alpha ramp
+    alpha = np.clip((diff - low_cutoff) / max(1.0, high_cutoff - low_cutoff) * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    if alpha_threshold > 0:
+        alpha[alpha < alpha_threshold] = 0
+
+    res_arr = arr.copy()
+    res_arr[:, :, 3] = alpha
+    return Image.fromarray(res_arr, mode="RGBA")
+
+
 def remove_background(
     image: Image.Image,
     alpha_threshold: int = 25,
